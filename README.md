@@ -65,7 +65,8 @@ Both heads read the final ODE state after a LayerNorm:
   frame: `uid = from_square + 64 · to_square`. Promotions are not distinguished; at play time a
   uid is resolved to the first legal move with that from/to, which is the queen promotion.
   Illegal moves are masked out only when choosing a move, not in the training loss.
-- **Value**: MLP 256 → 128 → 1 with GELU and no output squashing.
+- **Value**: MLP 256 → 128 → 1 with GELU and no output squashing, from the side to move's point of
+  view. It is trained jointly with the policy on game results (`--value-weight`, see below).
 
 ### Rules pretraining heads
 
@@ -109,15 +110,16 @@ python topcat_engine.py --mode test
 |---|---|
 | `test` | forward pass on the initial position and on a batch of 8, best move and an analysis of `4k3/8/8/8/8/8/8/4KR2 w - - 0 1` |
 | `play` | play against the engine in the terminal (`--color white/black`, moves in UCI or SAN) |
-| `policy_data` | build `{FEN: move uid}` from a Lichess `.pgn` / `.pgn.zst` dump (`--pgn`, `-` reads stdin) |
+| `policy_data` | build a policy dataset from a Lichess `.pgn` / `.pgn.zst` dump (`--pgn`, `-` reads stdin; `--opening-plies`, `--with-stats`) |
 | `pretrain_rules` | rules pretraining of the encoder (`--data` FEN JSON and/or `--random-positions N`, `--tasks`, `--workers`) |
-| `policy_train` | supervised policy training, then a match against a random player |
+| `policy_train` | supervised policy (+ value) training, then a match against a random player (`--value-weight`, `--patience`, `--games 0` skips the match) |
 | `eval_train` | value head training on `scores_dataset/ds1.json` |
 | `vs_random` | `--games` games with each color against a random player |
+| `match` | `--load` against `--opponent`: `--games` games with each color, both sampling with `--temperature` |
 | `selfplay` | symmetric actor-critic self-play (experimental, see below) |
 
 Common options: `--load` (checkpoint), `--out`, `--epochs`, `--batch-size`, `--lr`,
-`--max-samples`, `--temperature`, `--embed` / `--heads` / `--layers` (model size).
+`--max-samples`, `--temperature`, `--seed`, `--embed` / `--heads` / `--layers` (model size).
 
 ### Reproducing the reference model
 
@@ -145,21 +147,67 @@ Validation accuracy is measured with illegal moves masked out.
 Results of the original run with this recipe (no rules pretraining): validation accuracy ≈ 0.26 and,
 against a random player (40 + 40 games, T = 0.5), score ≈ 0.65 (W24 D56 L0).
 
+### Improved recipe
+
+```bash
+# opening positions + move counts + game results
+curl -s https://database.lichess.org/standard/lichess_db_standard_rated_2017-03.pgn.zst \
+  | python topcat_engine.py --mode policy_data --pgn - --opening-plies 10 --with-stats --out policy_dataset_v2.json
+
+python topcat_engine.py --mode policy_train --data policy_dataset_v2.json --load topcat_pretrain.pt \
+  --epochs 20 --batch-size 1024 --lr 2e-4 --value-weight 1.0 --patience 3 --seed 0
+```
+
+- `--opening-plies N` also samples every ply from 1 to N. The reference recipe starts at ply 6, so
+  a model trained on it has never seen the first moves of a game.
+- `--with-stats` stores, for every position, how often each move was played and the sum of the game
+  results from the side to move's point of view: `{FEN: {"moves": {uid: count}, "result": sum}}`.
+  The policy target becomes the distribution of played moves (up to the 16 most played) instead of
+  the move of the first game that reached the position, which matters for positions that occur in
+  many games, such as openings. Validation accuracy counts the most played move as correct.
+- `--value-weight w` trains the value head jointly with the policy:
+  `loss = policy cross-entropy + w · MSE(value, mean game result)`. Training it separately would
+  move the shared encoder away from the policy.
+- `--patience N` stops when the validation objective (policy loss + `w` · value MSE) has not
+  improved for N epochs.
+
 ### Checkpoints and resuming
 
-`policy_train`, `pretrain_rules` and `eval_train` write, after every epoch, the model
-(`--out`, a plain `state_dict` that `load_model(path)` loads with `strict=True`) and the full
-training state (`<out>_state.pt`: model, optimizer, scheduler, history and RNG states). Re-running
-the same command with `--resume` continues from the last completed epoch. On CPU the result is
-bit-identical to an uninterrupted run; on GPU it can differ only by floating-point nondeterminism.
-Keep the same `--epochs`, since it defines the learning-rate schedule.
+`policy_train`, `pretrain_rules` and `eval_train` write the full training state after every epoch
+(`<out>_state.pt`: model, optimizer, scheduler, history and RNG states). Re-running the same command
+with `--resume` continues from the last completed epoch, or does nothing if training already
+finished or stopped early. On CPU the result is bit-identical to an uninterrupted run; on GPU it can
+differ only by floating-point nondeterminism. Keep the same `--epochs`, since it defines the
+learning-rate schedule.
+
+The model itself (`--out`, a plain `state_dict` that `load_model(path)` loads with `strict=True`) is
+the **best epoch by validation objective** for `policy_train`, and the latest epoch for
+`pretrain_rules` and `eval_train`.
+
+### Results on Kaggle (Tesla T4)
+
+Reference dataset, 5 epochs of rules pretraining (7 min per epoch), then 50 epochs of policy training
+(5 min per epoch), about 4 h 45 min in total:
+
+| | val_acc | vs random (40 + 40 games, T = 0.5) |
+|---|---|---|
+| original run, no rules pretraining | ≈ 0.26 | 0.65 (W24 D56 L0) |
+| this code, with rules pretraining | 0.299 (best 0.301) | 0.81 (W51 D28 L1), 0.77 (W43 D37 L0) |
+
+Rules pretraining reached `legal_moves` recall@k 0.988 and F1 0.995 on both attack tasks. The
+policy started to overfit after about 20 epochs: validation loss was lowest at epoch 19 (2.787)
+and rose to 2.884 while the training loss kept falling. Validation accuracy stayed at about 0.30
+from epoch 17 on. These observations led to the improved recipe above; the notebook compares it
+with and without rules pretraining.
 
 ### Training on Kaggle
 
-[`notebooks/kaggle_train.ipynb`](notebooks/kaggle_train.ipynb) runs the whole pipeline on a Kaggle GPU:
-dataset, optional rules pretraining, policy training and evaluation. It stops before the session
-time limit and resumes in the next session from the previous run's output. Instructions are in the
-first cell.
+[`notebooks/kaggle_train.ipynb`](notebooks/kaggle_train.ipynb) runs the improved recipe on a Kaggle
+GPU: dataset, rules pretraining, policy + value training, the same training without rules
+pretraining (ablation), and an evaluation of both models against a random player and against each
+other (`match`). It stops right away without a GPU, stops before the session time limit, resumes in
+the next session from the previous run's output and skips finished steps (for example a rules
+pretraining restored from an earlier version). Instructions are in the first cell.
 
 ## Self-play RL (experimental)
 
@@ -182,6 +230,10 @@ pipeline.
   and play uses `Board` objects, so the `en_passant` token appears more often at play time than in
   training.
 - **Promotions:** the 4096-move encoding ignores the promotion piece (always resolved as a queen).
+- **Openings with the reference recipe:** positions start at ply 6, so its models play odd first
+  moves (1.e3 in the Kaggle run). Use `--opening-plies` with `--with-stats`.
+- **Tactics:** the policy imitates human moves and does not search; it can miss simple tactics
+  (in one test it played f4 instead of a back-rank mate in one).
 - **Hyperparameter search:** `--mode hpo` is not implemented. The original version never ran
   because of a `TypeError` that was silently caught.
 

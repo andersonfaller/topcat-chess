@@ -14,6 +14,12 @@ Reference model (pure supervised):
     python topcat_engine.py --mode policy_data --pgn lichess_db_standard_rated_2017-03.pgn.zst
     python topcat_engine.py --mode policy_train --data policy_dataset.json --resume
     python topcat_engine.py --mode vs_random --load topcat_policy.pt --games 40 --temperature 0.5
+
+Improved recipe (opening positions, played-move distributions, value head, early stopping):
+    python topcat_engine.py --mode policy_data --pgn - --opening-plies 10 --with-stats --out policy_dataset_v2.json
+    python topcat_engine.py --mode policy_train --data policy_dataset_v2.json --load topcat_pretrain.pt \\
+        --epochs 20 --value-weight 1.0 --patience 3 --seed 0
+    python topcat_engine.py --mode match --load model_a.pt --opponent model_b.pt --games 100
 """
 
 import argparse
@@ -383,46 +389,79 @@ def _maybe_resume(resume, checkpoint_path, n_epochs, modules, optimizer, schedul
     return start_epoch, history
 
 
+MAX_MOVES_PER_POSITION = 16  # most played moves kept per position in the with_stats format
+
+
+def _parse_policy_entry(entry):
+    """Value of a policy JSON entry -> ([(uid, weight), ...] most played first, value target or None).
+    Accepts uid (reference format) or {"moves": {uid: count}, "result": sum} (with_stats format)."""
+    if isinstance(entry, dict):
+        moves = sorted(((int(uid), float(n)) for uid, n in entry['moves'].items()), key=lambda m: -m[1])
+        total = sum(n for _, n in moves)
+        if total <= 0:
+            raise ValueError('position without moves')
+        value = entry['result'] / total if 'result' in entry else None
+        return moves, value
+    return [(int(entry), 1.0)], None
+
+
 class PolicyDataset(torch.utils.data.Dataset):
-    """Pre-tokenized JSON {FEN: move_uid}. Tokens are stored as uint8 [N, 5, 64]."""
+    """Pre-tokenized policy dataset (see build_policy_dataset_from_pgn for the JSON formats).
+    Tokens are stored as uint8 [N, 5, 64]; targets as the K most played moves per position
+    (move_uids int16 [N, K], move_probs [N, K], zero-padded) and an optional value target
+    (values [N], NaN when unknown)."""
 
     def __init__(self, tokenizer, json_path, max_samples=None):
         with open(json_path) as f:
             data = json.load(f)
 
-        self.fens, tokens, targets = [], [], []
+        self.fens, tokens, all_moves, values = [], [], [], []
         n_invalid = 0
         t0 = time.time()
-        for fen, uid in data.items():
+        for fen, entry in data.items():
             if max_samples is not None and len(self.fens) >= max_samples:
                 break
             try:
-                uid = int(uid)
-                if not 0 <= uid < N_MOVES:
-                    raise ValueError(f'uid out of range: {uid}')
+                moves, value = _parse_policy_entry(entry)
+                moves = moves[:MAX_MOVES_PER_POSITION]
+                if not all(0 <= uid < N_MOVES for uid, _ in moves):
+                    raise ValueError('uid out of range')
                 tok = tokenizer.tokenize_board(fen)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, KeyError, AttributeError):
                 n_invalid += 1
                 continue
             self.fens.append(fen)
             tokens.append(torch.stack(tok))
-            targets.append(uid)
+            all_moves.append(moves)
+            values.append(float('nan') if value is None else value)
             if len(self.fens) % 100_000 == 0:
                 print(f'  tokenized {len(self.fens):,} positions ({time.time() - t0:.0f}s)', flush=True)
 
+        k = max(len(moves) for moves in all_moves)
         self.tokens = torch.stack(tokens).to(torch.uint8)
-        self.targets = torch.tensor(targets, dtype=torch.long)
-        print(f'PolicyDataset: {len(self.fens):,} positions ({n_invalid} invalid skipped) from {json_path}')
+        self.move_uids = torch.tensor([[uid for uid, _ in moves] + [0] * (k - len(moves))
+                                       for moves in all_moves], dtype=torch.int16)
+        self.move_probs = torch.tensor([[w for _, w in moves] + [0.0] * (k - len(moves))
+                                        for moves in all_moves], dtype=torch.float32)
+        self.move_probs /= self.move_probs.sum(dim=1, keepdim=True)
+        self.values = torch.tensor(values, dtype=torch.float32)
+        self.has_values = bool((~torch.isnan(self.values)).any())
+        print(f'PolicyDataset: {len(self.fens):,} positions ({n_invalid} invalid skipped) from {json_path}'
+              f'{" | with game results" if self.has_values else ""}')
 
     def __len__(self):
         return len(self.fens)
 
     def __getitem__(self, idx):
         tok = self.tokens[idx].long()
-        return tok[0], tok[1], tok[2], tok[3], tok[4], self.targets[idx]
+        return (tok[0], tok[1], tok[2], tok[3], tok[4],
+                self.move_uids[idx].long(), self.move_probs[idx], self.values[idx])
 
     def get_batch(self, idx, device=DEVICE):
-        return _tokens_to_device(self.tokens[idx], device), self.targets[idx].to(device)
+        """-> (5 token tensors, (move uids [B, K], move probs [B, K], values [B])) on the device."""
+        targets = (self.move_uids[idx].to(device).long(), self.move_probs[idx].to(device),
+                   self.values[idx].to(device))
+        return _tokens_to_device(self.tokens[idx], device), targets
 
 
 def _split_indices(dataset, val_fraction, seed=42):
@@ -433,70 +472,134 @@ def _split_indices(dataset, val_fraction, seed=42):
     return torch.tensor(train_set.indices, dtype=torch.long), torch.tensor(val_set.indices, dtype=torch.long)
 
 
+def _policy_loss(logits, move_uids, move_probs):
+    """Per-sample cross-entropy against a sparse move distribution (= F.cross_entropy when one-hot)."""
+    return -(move_probs * F.log_softmax(logits, dim=-1).gather(1, move_uids)).sum(dim=-1)
+
+
+def _epochs_since_best(values):
+    """Epochs since the minimum of `values` (0 when the last one is the best)."""
+    if not values:
+        return 0
+    return len(values) - 1 - min(range(len(values)), key=values.__getitem__)
+
+
 def train_policy_supervised(model, json_path, n_epochs=5, batch_size=512, lr=1e-4,
-                            max_samples=None, checkpoint_path='topcat_policy.pt', resume=False):
-    """Cross-entropy on the policy head. After every epoch the model is written to
-    checkpoint_path and the full training state to <checkpoint>_state.pt (see resume)."""
+                            max_samples=None, checkpoint_path='topcat_policy.pt', resume=False,
+                            value_weight=0.0, patience=None):
+    """Supervised training of the policy head, plus the value head when value_weight > 0 and the
+    dataset has game results (with_stats format):
+        loss = cross-entropy on the played-move distribution + value_weight * MSE(value, result)
+    checkpoint_path keeps the best epoch by validation objective (validation policy loss +
+    value_weight * validation value MSE) and <checkpoint>_state.pt the latest epoch (see resume).
+    With patience, training stops once the objective has not improved for `patience` epochs.
+    Returns the history; the model ends with the weights of the best epoch."""
     dataset = PolicyDataset(model.tokenizer, json_path, max_samples)
     train_idx, val_idx = _split_indices(dataset, 0.05)
     device = model.device
     print(f'Train: {len(train_idx):,} | validation: {len(val_idx):,}')
+    use_value = value_weight > 0 and dataset.has_values
+    if value_weight > 0 and not dataset.has_values:
+        print('WARNING: the dataset has no game results (build it with --with-stats); value head not trained')
+    if use_value:
+        val_values = dataset.values[val_idx]
+        val_values = val_values[~torch.isnan(val_values)]
+        print(f'Value baseline (always predict the mean): val MSE {val_values.var(unbiased=False).item():.4f}')
 
     # legality masks of the validation set (accuracy only)
     val_masks = torch.stack([legal_move_mask(chess.Board(dataset.fens[i])) for i in val_idx.tolist()])
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-    criterion = nn.CrossEntropyLoss()
     modules = {'model': model}
-    start_epoch, history = _maybe_resume(resume, checkpoint_path, n_epochs, modules, optimizer, scheduler,
-                                         {'train_loss': [], 'val_loss': [], 'val_acc': []})
+    state_path = _training_state_path(checkpoint_path)
+    start_epoch, history = _maybe_resume(resume, checkpoint_path, n_epochs, modules, optimizer, scheduler, {})
+    for key in ('train_loss', 'val_loss', 'val_acc', 'val_objective') + (
+            ('train_value_mse', 'val_value_mse') if use_value else ()):
+        history.setdefault(key, [])
+
+    def value_terms(value, targets):
+        """-> (sum of squared errors, number of known targets)"""
+        known = ~torch.isnan(targets)
+        if not known.any():
+            return value.new_zeros(()), 0
+        return ((value.squeeze(-1)[known] - targets[known]) ** 2).sum(), int(known.sum())
 
     for epoch in range(start_epoch, n_epochs):
+        if patience and _epochs_since_best(history['val_objective']) >= patience:
+            print(f'Early stopping: no improvement of the validation objective for {patience} epochs')
+            history['stopped_early'] = True
+            _save_training_state(state_path, epoch, modules, optimizer, scheduler, history)
+            break
         t0 = time.time()
         model.train()
         perm = train_idx[torch.randperm(len(train_idx))]
-        loss_sum, n_seen = 0.0, 0
+        loss_sum, value_sse, n_seen, n_values = 0.0, 0.0, 0, 0
         for start in range(0, len(perm), batch_size):
             idx = perm[start:start + batch_size]
-            inputs, target = dataset.get_batch(idx, device)
-            logits, _ = model(*inputs)
-            loss = criterion(logits, target)  # no legality mask
+            inputs, (move_uids, move_probs, values) = dataset.get_batch(idx, device)
+            logits, value = model(*inputs)
+            loss = _policy_loss(logits, move_uids, move_probs).mean()  # no legality mask
+            loss_sum += loss.item() * len(idx)
+            if use_value:
+                sse, n = value_terms(value, values)
+                if n:
+                    loss = loss + value_weight * sse / n
+                    value_sse += sse.item()
+                    n_values += n
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            loss_sum += loss.item() * len(idx)
             n_seen += len(idx)
         scheduler.step()
 
         model.eval()
-        val_loss_sum, n_correct = 0.0, 0
+        val_loss_sum, val_sse, n_correct, n_val_values = 0.0, 0.0, 0, 0
         with torch.no_grad():
             for start in range(0, len(val_idx), batch_size):
                 idx = val_idx[start:start + batch_size]
-                inputs, target = dataset.get_batch(idx, device)
-                logits, _ = model(*inputs)
-                val_loss_sum += F.cross_entropy(logits, target, reduction='sum').item()
+                inputs, (move_uids, move_probs, values) = dataset.get_batch(idx, device)
+                logits, value = model(*inputs)
+                val_loss_sum += _policy_loss(logits, move_uids, move_probs).sum().item()
                 mask = val_masks[start:start + batch_size].to(device)
                 pred = logits.masked_fill(~mask, float('-inf')).argmax(dim=-1)
-                n_correct += (pred == target).sum().item()
+                n_correct += (pred == move_uids[:, 0]).sum().item()  # most played move
+                if use_value:
+                    sse, n = value_terms(value, values)
+                    val_sse += sse.item()
+                    n_val_values += n
 
         train_loss = loss_sum / max(n_seen, 1)
         val_loss = val_loss_sum / max(len(val_idx), 1)
         val_acc = n_correct / max(len(val_idx), 1)
+        objective = val_loss
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
-        print(f'Epoch {epoch + 1}/{n_epochs} | train_loss {train_loss:.4f} | val_loss {val_loss:.4f} '
-              f'| val_acc {val_acc:.4f} | lr {scheduler.get_last_lr()[0]:.2e} | {time.time() - t0:.0f}s',
+        text = (f'Epoch {epoch + 1}/{n_epochs} | train_loss {train_loss:.4f} | val_loss {val_loss:.4f} '
+                f'| val_acc {val_acc:.4f}')
+        if use_value:
+            train_value_mse = value_sse / max(n_values, 1)
+            val_value_mse = val_sse / max(n_val_values, 1)
+            objective = val_loss + value_weight * val_value_mse
+            history['train_value_mse'].append(train_value_mse)
+            history['val_value_mse'].append(val_value_mse)
+            text += f' | value mse train {train_value_mse:.4f} val {val_value_mse:.4f}'
+        history['val_objective'].append(objective)
+        is_best = _epochs_since_best(history['val_objective']) == 0
+        if is_best:
+            torch.save(model.state_dict(), checkpoint_path)
+        print(f'{text} | lr {scheduler.get_last_lr()[0]:.2e} | {time.time() - t0:.0f}s{" | best" if is_best else ""}',
               flush=True)
-        torch.save(model.state_dict(), checkpoint_path)
-        _save_training_state(_training_state_path(checkpoint_path), epoch + 1, modules,
-                             optimizer, scheduler, history)
+        _save_training_state(state_path, epoch + 1, modules, optimizer, scheduler, history)
 
-    torch.save(model.state_dict(), checkpoint_path)
-    print(f'Checkpoint saved to {checkpoint_path}')
+    if os.path.exists(checkpoint_path):
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    if history['val_objective']:
+        best = min(range(len(history['val_objective'])), key=history['val_objective'].__getitem__)
+        print(f'Best epoch {best + 1} (val objective {history["val_objective"][best]:.4f}) '
+              f'saved to {checkpoint_path}')
     return history
 
 
@@ -616,13 +719,24 @@ def _open_pgn(path):
     return io.TextIOWrapper(raw, encoding='utf-8', errors='replace')
 
 
+_RESULT_SCORES = {'1-0': 1.0, '0-1': -1.0, '1/2-1/2': 0.0}
+
+
 def build_policy_dataset_from_pgn(pgn_path, out_json='policy_dataset.json', min_elo=1500,
-                                  min_ply=6, max_ply=120, ply_step=3, max_positions=500_000):
-    """Builds {FEN: uid} with the reference recipe: only games with WhiteElo >= min_elo,
-    ply (1-based: number of the half-move about to be played) in min_ply..max_ply with
-    ply % ply_step == 0, FEN before the move, deduplicated by FEN. Stops at the end of the game
-    in which the total reaches max_positions.
-    lichess_db_standard_rated_2017-03 yields 500,019 positions from 34,879 games read."""
+                                  min_ply=6, max_ply=120, ply_step=3, max_positions=500_000,
+                                  opening_plies=0, with_stats=False):
+    """Builds a policy dataset from a PGN dump. Defaults = the reference recipe: only games with
+    WhiteElo >= min_elo, ply (1-based: number of the half-move about to be played) in
+    min_ply..max_ply with ply % ply_step == 0, FEN before the move. Stops at the end of the game
+    in which the number of distinct positions reaches max_positions.
+    lichess_db_standard_rated_2017-03 yields 500,019 positions from 34,879 games read.
+
+    opening_plies: also sample every ply from 1 to opening_plies (opening positions).
+    with_stats=False: {FEN: uid}, keeping the move of the first game that reached the position.
+    with_stats=True:  {FEN: {"moves": {uid: count}, "result": sum}}, with every move played from
+        the position and the sum of the game results from the side to move's point of view
+        (+1 win, 0 draw, -1 loss; value target = sum / number of moves). Games without a result
+        are skipped."""
     data = {}
     n_read = n_used = 0
     t0 = time.time()
@@ -640,16 +754,24 @@ def build_policy_dataset_from_pgn(pgn_path, out_json='policy_dataset.json', min_
                 continue
             if white_elo < min_elo:
                 continue
+            white_score = _RESULT_SCORES.get(game.headers.get('Result'))
+            if with_stats and white_score is None:
+                continue
             n_used += 1
             board = game.board()
             for move in game.mainline_moves():
                 ply = board.ply() + 1
-                if ply > max_ply:
+                if ply > max(max_ply, opening_plies):
                     break
-                if ply >= min_ply and ply % ply_step == 0:
+                if ply <= opening_plies or (min_ply <= ply <= max_ply and ply % ply_step == 0):
                     fen = board.fen()
-                    if fen not in data:
-                        data[fen] = uci_to_uid(move.uci()[:4], mirror=not board.turn)
+                    uid = uci_to_uid(move.uci()[:4], mirror=not board.turn)
+                    if with_stats:
+                        entry = data.setdefault(fen, {'moves': {}, 'result': 0.0})
+                        entry['moves'][uid] = entry['moves'].get(uid, 0) + 1
+                        entry['result'] += white_score if board.turn == chess.WHITE else -white_score
+                    elif fen not in data:
+                        data[fen] = uid
                 board.push(move)
 
     with open(out_json, 'w') as f:
@@ -1188,31 +1310,49 @@ def analyze_position(model, board, top_k=10):
     return best
 
 
-def evaluate_vs_random(model, n_games=20, max_moves=200, temperature=0.5, verbose=True):
-    """Plays n_games with each color against a random opponent. score = (W + 0.5·D) / total."""
+def play_match(move_fn, opponent_fn, n_games=20, max_moves=200):
+    """Plays n_games with each color: move_fn(board) against opponent_fn(board).
+    Games reaching max_moves plies are draws. -> {'wins', 'draws', 'losses', 'score'} for move_fn."""
     wins = draws = losses = 0
-    for model_color in (chess.WHITE, chess.BLACK):
+    for color in (chess.WHITE, chess.BLACK):
         for _ in range(n_games):
             board = chess.Board()
             while not board.is_game_over() and board.ply() < max_moves:
-                if board.turn == model_color:
-                    move = _model_move(model, board, temperature)
-                else:
-                    move = random.choice(list(board.legal_moves))
-                board.push(move)
+                board.push(move_fn(board) if board.turn == color else opponent_fn(board))
             outcome = board.outcome()
             if outcome is None or outcome.winner is None:
                 draws += 1
-            elif outcome.winner == model_color:
+            elif outcome.winner == color:
                 wins += 1
             else:
                 losses += 1
     total = wins + draws + losses
-    score = (wins + 0.5 * draws) / total
+    return {'wins': wins, 'draws': draws, 'losses': losses,
+            'score': (wins + 0.5 * draws) / total if total else 0.0}
+
+
+def _print_match(label, result):
+    print(f'{label}: W{result["wins"]} D{result["draws"]} L{result["losses"]} | score {result["score"]:.3f}',
+          flush=True)
+
+
+def evaluate_vs_random(model, n_games=20, max_moves=200, temperature=0.5, verbose=True):
+    """Plays n_games with each color against a random opponent. score = (W + 0.5·D) / total."""
+    result = play_match(lambda board: _model_move(model, board, temperature),
+                        lambda board: random.choice(list(board.legal_moves)), n_games, max_moves)
     if verbose:
-        print(f'vs random ({n_games}+{n_games} games, T={temperature}): '
-              f'W{wins} D{draws} L{losses} | score {score:.3f}', flush=True)
-    return {'wins': wins, 'draws': draws, 'losses': losses, 'score': score}
+        _print_match(f'vs random ({n_games}+{n_games} games, T={temperature})', result)
+    return result
+
+
+def evaluate_match(model, opponent, n_games=20, max_moves=200, temperature=0.5, verbose=True):
+    """Head-to-head: model against another model, n_games with each color, both sampling with
+    `temperature` (> 0 so that games differ). Score from `model`'s point of view."""
+    result = play_match(lambda board: _model_move(model, board, temperature),
+                        lambda board: _model_move(opponent, board, temperature), n_games, max_moves)
+    if verbose:
+        _print_match(f'match ({n_games}+{n_games} games, T={temperature})', result)
+    return result
 
 
 def evaluate_vs_stockfish(model, engine_path='stockfish', n_games=10, time_limit=0.05,
@@ -1221,31 +1361,15 @@ def evaluate_vs_stockfish(model, engine_path='stockfish', n_games=10, time_limit
     engine = chess.engine.SimpleEngine.popen_uci(engine_path)
     if skill_level is not None:
         engine.configure({'Skill Level': skill_level})
-    wins = draws = losses = 0
     try:
-        for model_color in (chess.WHITE, chess.BLACK):
-            for _ in range(n_games):
-                board = chess.Board()
-                while not board.is_game_over() and board.ply() < max_moves:
-                    if board.turn == model_color:
-                        move = _model_move(model, board, temperature)
-                    else:
-                        move = engine.play(board, chess.engine.Limit(time=time_limit)).move
-                    board.push(move)
-                outcome = board.outcome()
-                if outcome is None or outcome.winner is None:
-                    draws += 1
-                elif outcome.winner == model_color:
-                    wins += 1
-                else:
-                    losses += 1
+        result = play_match(lambda board: _model_move(model, board, temperature),
+                            lambda board: engine.play(board, chess.engine.Limit(time=time_limit)).move,
+                            n_games, max_moves)
     finally:
         engine.quit()
-    total = wins + draws + losses
-    score = (wins + 0.5 * draws) / total
     if verbose:
-        print(f'vs Stockfish ({n_games}+{n_games} games): W{wins} D{draws} L{losses} | score {score:.3f}')
-    return {'wins': wins, 'draws': draws, 'losses': losses, 'score': score}
+        _print_match(f'vs Stockfish ({n_games}+{n_games} games)', result)
+    return result
 
 
 def _board_ascii(board, orientation=chess.WHITE):
@@ -1341,7 +1465,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='TopCat chess engine (transformer + Neural ODE)')
     parser.add_argument('--mode', default='test',
                         choices=['eval_train', 'selfplay', 'test', 'play', 'hpo',
-                                 'policy_data', 'policy_train', 'vs_random', 'pretrain_rules'])
+                                 'policy_data', 'policy_train', 'vs_random', 'pretrain_rules', 'match'])
     parser.add_argument('--load', default=None, help='checkpoint (state_dict) to load')
     parser.add_argument('--embed', type=int, default=256)
     parser.add_argument('--heads', type=int, default=8)
@@ -1355,7 +1479,17 @@ def main(argv=None):
     parser.add_argument('--batch-size', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--max-samples', type=int, default=None)
-    parser.add_argument('--games', type=int, default=None, help='games per color vs random')
+    parser.add_argument('--games', type=int, default=None, help='games per color (vs_random, match)')
+    parser.add_argument('--opponent', default=None, help='match: checkpoint of the opposing model')
+    parser.add_argument('--seed', type=int, default=None, help='seed for torch and random')
+    parser.add_argument('--opening-plies', type=int, default=0,
+                        help='policy_data: also sample every ply from 1 to N (opening positions)')
+    parser.add_argument('--with-stats', action='store_true',
+                        help='policy_data: store move counts and game results per position')
+    parser.add_argument('--value-weight', type=float, default=0.0,
+                        help='policy_train: weight of the value loss (needs a --with-stats dataset)')
+    parser.add_argument('--patience', type=int, default=None,
+                        help='policy_train: stop after N epochs without validation improvement')
     parser.add_argument('--episodes', type=int, default=200)
     parser.add_argument('--curriculum', type=int, default=0, choices=[0, 1, 2])
     parser.add_argument('--random-positions', type=int, default=0,
@@ -1371,6 +1505,10 @@ def main(argv=None):
     def pick(value, default):
         return default if value is None else value
 
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+
     if args.mode == 'hpo':
         try:
             run_hpo()
@@ -1382,7 +1520,8 @@ def main(argv=None):
         if args.pgn is None:
             parser.error('--mode policy_data requires --pgn')
         build_policy_dataset_from_pgn(args.pgn, pick(args.out, 'policy_dataset.json'),
-                                      max_positions=pick(args.max_samples, 500_000))
+                                      max_positions=pick(args.max_samples, 500_000),
+                                      opening_plies=args.opening_plies, with_stats=args.with_stats)
         return 0
 
     model_kwargs = {'embed_dim': args.embed, 'num_heads': args.heads, 'n_layers': args.layers}
@@ -1394,6 +1533,11 @@ def main(argv=None):
         play_interactive(model, human_color=args.color, temperature=pick(args.temperature, 0.0))
     elif args.mode == 'vs_random':
         evaluate_vs_random(model, n_games=pick(args.games, 40), temperature=pick(args.temperature, 0.5))
+    elif args.mode == 'match':
+        if args.opponent is None:
+            parser.error('--mode match requires --opponent')
+        opponent = load_model(args.opponent, **model_kwargs)
+        evaluate_match(model, opponent, n_games=pick(args.games, 40), temperature=pick(args.temperature, 0.5))
     elif args.mode == 'eval_train':
         train_evaluation(model, json_path=pick(args.data, 'scores_dataset/ds1.json'),
                          n_epochs=pick(args.epochs, 20), batch_size=pick(args.batch_size, 256),
@@ -1403,8 +1547,10 @@ def main(argv=None):
         train_policy_supervised(model, json_path=pick(args.data, 'policy_dataset.json'),
                                 n_epochs=pick(args.epochs, 50), batch_size=pick(args.batch_size, 1024),
                                 lr=pick(args.lr, 2e-4), max_samples=args.max_samples,
-                                checkpoint_path=pick(args.out, 'topcat_policy.pt'), resume=args.resume)
-        evaluate_vs_random(model, n_games=pick(args.games, 40), temperature=pick(args.temperature, 0.5))
+                                checkpoint_path=pick(args.out, 'topcat_policy.pt'), resume=args.resume,
+                                value_weight=args.value_weight, patience=args.patience)
+        if pick(args.games, 40) > 0:  # --games 0 skips the final match against a random player
+            evaluate_vs_random(model, n_games=pick(args.games, 40), temperature=pick(args.temperature, 0.5))
     elif args.mode == 'selfplay':
         temperatures = (0.8, 1.2) if args.temperature is None else (args.temperature, args.temperature)
         run_selfplay_symmetric_loop(model, n_episodes=args.episodes, lr=pick(args.lr, 1e-5),
